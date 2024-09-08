@@ -288,5 +288,5 @@ func main() {
     writerIPv6.Write([]string{"domain", "NS", "IP"})
     writerIPv6.WriteAll(finalResultsIPv6)
 
-    fmt.Println("[INFO] Finished writing results to output/auth-tld-ns-ipv4.csv and output/auth-tld-ns-ipv6.csv")
+    fmt.Println("[INFO] Finished writing results to output/auth-ns-ipv4.csv and output/auth-ns-ipv6.csv\n")
 }
