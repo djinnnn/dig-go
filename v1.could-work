@@ -1,0 +1,216 @@
+package main
+
+import (
+    "bufio"
+    "encoding/csv"
+    "fmt"
+    "os"
+    "os/exec"
+    "strings"
+    "sync"
+    "github.com/schollz/progressbar/v3"
+)
+
+// 查询 NS 记录的函数
+func digNS(domain string, cache map[string][]string, mu *sync.Mutex) []string {
+    mu.Lock()
+    if nsRecords, found := cache[domain]; found {
+        mu.Unlock()
+        return nsRecords
+    }
+    mu.Unlock()
+
+    cmd := exec.Command("dig", domain, "NS", "+short")
+    output, err := cmd.Output()
+    if err != nil {
+        fmt.Printf("[Error] Failed to execute dig command for domain %s: %v\n", domain, err)
+        return []string{}
+    }
+
+    var nsRecords []string
+    scanner := bufio.NewScanner(strings.NewReader(string(output)))
+    for scanner.Scan() {
+        nsRecord := strings.TrimSpace(scanner.Text())
+        if nsRecord != "" {
+            nsRecords = append(nsRecords, nsRecord)
+        }
+    }
+
+    if len(nsRecords) == 0 {
+        fmt.Printf("[No NS] No NS records found for domain: %s\n", domain)
+    }
+
+    mu.Lock()
+    cache[domain] = nsRecords
+    mu.Unlock()
+
+    return nsRecords
+}
+
+// 查询 A 记录的函数
+func digIP(ns string, cache map[string][]string, mu *sync.Mutex) []string {
+    mu.Lock()
+    if ipRecords, found := cache[ns]; found {
+        mu.Unlock()
+        return ipRecords
+    }
+    mu.Unlock()
+
+    cmd := exec.Command("dig", ns, "A", "+short")
+    output, err := cmd.Output()
+    if err != nil {
+        fmt.Printf("[Error] Failed to execute dig command for NS %s: %v\n", ns, err)
+        return []string{}
+    }
+
+    var ipRecords []string
+    scanner := bufio.NewScanner(strings.NewReader(string(output)))
+    for scanner.Scan() {
+        ipRecord := strings.TrimSpace(scanner.Text())
+        if ipRecord != "" {
+            ipRecords = append(ipRecords, ipRecord)
+        }
+    }
+
+    if len(ipRecords) == 0 {
+        fmt.Printf("[No A Record] No A records found for NS: %s\n", ns)
+        ipRecords = append(ipRecords, "")
+    }
+
+    mu.Lock()
+    cache[ns] = ipRecords
+    mu.Unlock()
+
+    return ipRecords
+}
+
+// 处理单个域名
+func processDomain(domain string, mu *sync.Mutex, results *[][]string, bar *progressbar.ProgressBar, sem chan struct{}, cache map[string][]string) {
+    defer func() { <-sem }() // 释放一个占用的通道
+
+    nsRecords := digNS(domain, cache, mu)
+    var domainNSIPList [][]string
+
+    if len(nsRecords) > 0 {
+        for _, ns := range nsRecords {
+            ipRecords := digIP(ns, cache, mu)
+            if len(ipRecords) == 0 {
+                domainNSIPList = append(domainNSIPList, []string{domain, ns, ""})
+            } else {
+                for _, ip := range ipRecords {
+                    domainNSIPList = append(domainNSIPList, []string{domain, ns, ip})
+                }
+            }
+        }
+    } else {
+        domainNSIPList = append(domainNSIPList, []string{domain, "", ""}) // 没有 NS 记录
+    }
+
+    mu.Lock()
+    *results = append(*results, domainNSIPList...)
+    mu.Unlock()
+
+    bar.Add(1)
+}
+
+// 处理文件
+func processFile(filename string, results chan<- [][]string, maxThreads int, cache map[string][]string, cacheMutex *sync.Mutex, wgMain *sync.WaitGroup) {
+    defer wgMain.Done()
+
+    file, err := os.Open(filename)
+    if err != nil {
+        fmt.Println("Error opening file:", err)
+        return
+    }
+    defer file.Close()
+
+    reader := csv.NewReader(file)
+    domains, err := reader.ReadAll()
+    if err != nil {
+        fmt.Println("Error reading CSV:", err)
+        return
+    }
+
+    var wg sync.WaitGroup
+    var mu sync.Mutex
+    chunkResults := make([][]string, 0)
+    bar := progressbar.NewOptions(len(domains)-1,
+        progressbar.OptionSetDescription("Processing domains in "+filename),
+        progressbar.OptionSetPredictTime(true),
+        progressbar.OptionShowCount(),
+        progressbar.OptionFullWidth(),
+        progressbar.OptionShowIts(),
+    )
+
+    sem := make(chan struct{}, maxThreads)
+
+    for _, domain := range domains[1:] { // 跳过标题行
+        wg.Add(1)
+        sem <- struct{}{}
+        go func(domain string) {
+            defer wg.Done()
+            processDomain(domain, &mu, &chunkResults, bar, sem, cache)
+        }(domain[0])
+    }
+
+    wg.Wait()
+    bar.Finish()
+
+    fmt.Printf("[INFO] Sending %d records to results channel from file %s\n", len(chunkResults), filename)
+    results <- chunkResults // 确保所有结果被发送到通道
+}
+
+func main() {
+    files := []string{"/home/lcl/wy/Projects/DoQ/auth/input-rowdata/tls-domain.csv"}
+    results := make(chan [][]string)
+    finalResults := make([][]string, 0)
+    cache := make(map[string][]string)
+    var cacheMutex sync.Mutex
+
+    var wgMain sync.WaitGroup
+    var finalResultsMutex sync.Mutex
+    var resultsWaitGroup sync.WaitGroup
+
+    resultsWaitGroup.Add(1)  // 等待 results 处理完成
+
+    go func() {
+        defer resultsWaitGroup.Done()
+        for res := range results {
+            finalResultsMutex.Lock()
+            fmt.Printf("[INFO] Received %d records, processing...\n", len(res))
+            finalResults = append(finalResults, res...)
+            fmt.Printf("[INFO] Total records in finalResults: %d\n", len(finalResults))
+            finalResultsMutex.Unlock()
+        }
+    }()
+
+    maxThreads := 10
+
+    for _, file := range files {
+        wgMain.Add(1)
+        go processFile(file, results, maxThreads, cache, &cacheMutex, &wgMain)
+    }
+
+    wgMain.Wait()  // 等待所有文件处理完成
+    close(results) // 确保所有数据传输完成后再关闭通道
+
+    resultsWaitGroup.Wait()  // 等待所有数据接收完毕
+
+    fmt.Printf("[INFO] Writing %d results to file\n", len(finalResults))
+
+    // 将结果保存到 CSV 文件
+    outFile, err := os.Create("output/auth-tld-ns.csv")
+    if err != nil {
+        fmt.Println("Error creating output file:", err)
+        return
+    }
+    defer outFile.Close()
+
+    writer := csv.NewWriter(outFile)
+    defer writer.Flush()
+
+    writer.Write([]string{"domain", "NS", "IP"})
+    writer.WriteAll(finalResults)
+
+    fmt.Println("[INFO] Finished writing results to output/auth-tld-ns.csv")
+}

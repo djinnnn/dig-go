@@ -1,0 +1,193 @@
+//package main
+
+import (
+    "encoding/csv"
+    "fmt"
+    "os"
+    "sync"
+    "time"
+
+    //"path/filepath"
+    "github.com/miekg/dns"
+    "github.com/schollz/progressbar/v3"
+)
+
+// 定义查询NS记录的函数
+func digNS(domain string, cache map[string][]string, mu *sync.Mutex) []string {
+    mu.Lock()
+    if nsRecords, found := cache[domain]; found {
+        mu.Unlock()
+        return nsRecords
+    }
+    mu.Unlock()
+
+    m := new(dns.Msg)
+    m.SetQuestion(dns.Fqdn(domain), dns.TypeNS)
+    c := new(dns.Client)
+    r, _, err := c.Exchange(m, "8.8.8.8:53")
+    if err != nil {
+        return []string{}
+    }
+
+    var nsRecords []string
+    for _, ans := range r.Answer {
+        if ns, ok := ans.(*dns.NS); ok {
+            nsRecords = append(nsRecords, ns.Ns)
+        }
+    }
+
+    mu.Lock()
+    cache[domain] = nsRecords
+    mu.Unlock()
+
+    return nsRecords
+}
+
+// 定义查询IP地址的函数
+func digIP(ns string, cache map[string][]string, mu *sync.Mutex) []string {
+    mu.Lock()
+    if ipRecords, found := cache[ns]; found {
+        mu.Unlock()
+        return ipRecords
+    }
+    mu.Unlock()
+
+    m := new(dns.Msg)
+    m.SetQuestion(dns.Fqdn(ns), dns.TypeA)
+    c := new(dns.Client)
+    r, _, err := c.Exchange(m, "8.8.8.8:53")
+    if err != nil {
+        return []string{}
+    }
+
+    var ipRecords []string
+    for _, ans := range r.Answer {
+        if a, ok := ans.(*dns.A); ok {
+            ipRecords = append(ipRecords, a.A.String())
+        }
+    }
+
+    mu.Lock()
+    cache[ns] = ipRecords
+    mu.Unlock()
+
+    return ipRecords
+}
+
+// 定义对单个域名进行处理的函数
+func processDomain(domain string, wg *sync.WaitGroup, mu *sync.Mutex, results *[][]string, bar *progressbar.ProgressBar, sem chan struct{}, cache map[string][]string) {
+    defer wg.Done()
+    defer func() { <-sem }() // 释放一个占用的通道
+
+    nsRecords := digNS(domain, cache, mu)
+    var domainNSIPList [][]string
+    if len(nsRecords) > 0 { // 只有在有NS记录时才进行IP地址查询
+        for _, ns := range nsRecords {
+            ipRecords := digIP(ns, cache, mu)
+            if len(ipRecords) == 0 {
+                domainNSIPList = append(domainNSIPList, []string{domain, ns, ""})
+            } else {
+                for _, ip := range ipRecords {
+                    domainNSIPList = append(domainNSIPList, []string{domain, ns, ip})
+                }
+            }
+        }
+    } else {
+        domainNSIPList = append(domainNSIPList, []string{domain, "", ""}) // NS记录为空
+    }
+
+    mu.Lock()
+    *results = append(*results, domainNSIPList...)
+    mu.Unlock()
+
+    bar.Add(1)
+}
+
+func processFile(filename string, results chan<- [][]string, maxThreads int, cache map[string][]string, cacheMutex *sync.Mutex) {
+    file, err := os.Open(filename)
+    if err != nil {
+        fmt.Println("Error opening file:", err)
+        return
+    }
+    defer file.Close()
+
+    reader := csv.NewReader(file)
+    domains, err := reader.ReadAll()
+    if err != nil {
+        fmt.Println("Error reading CSV:", err)
+        return
+    }
+
+    var wg sync.WaitGroup
+    var mu sync.Mutex
+    chunkResults := make([][]string, 0)
+    bar := progressbar.NewOptions(len(domains)-1,
+        progressbar.OptionSetDescription("Processing domains in "+filename),
+        progressbar.OptionSetPredictTime(true),
+        progressbar.OptionShowCount(),
+        progressbar.OptionFullWidth(),
+        progressbar.OptionThrottle(65*time.Millisecond),
+        progressbar.OptionShowIts(),
+        progressbar.OptionOnCompletion(func() {
+            fmt.Println("\nProcessing complete for", filename)
+        }),
+    )
+
+    sem := make(chan struct{}, maxThreads)
+
+    // 包装并发处理域名查询
+    for _, domain := range domains[1:] { // 跳过标题行
+        wg.Add(1)
+        sem <- struct{}{} // 占用一个通道
+        go processDomain(domain[0], &wg, &mu, &chunkResults, bar, sem, cache)
+    }
+
+    wg.Wait()
+    bar.Finish()
+
+    results <- chunkResults
+}
+
+func main() {
+    // 获取所有chunk文件
+    //files, err := filepath.Glob("chunk-data/chunk_*.csv")
+    //files, err := filepath.Glob("auth-test.csv")
+    //if err != nil {
+    //    fmt.Println("Error getting chunk files:", err)
+    //    return
+    //}
+    //files := []string{"/mnt/data/wuyue/2024_doq/auth-data/auth-rowdata/tlds-alpha-by-domain.csv",}
+    files := []string{"/home/lcl/wy/Projects/DoQ/auth/input-rowdata/tls-domain.csv",}
+    results := make(chan [][]string)
+    finalResults := make([][]string, 0)
+    cache := make(map[string][]string)
+    var cacheMutex sync.Mutex
+
+    go func() {
+        for res := range results {
+            finalResults = append(finalResults, res...)
+        }
+    }()
+
+    maxThreads := 10 // 设置每个文件处理时的最大线程数量
+
+    for _, file := range files {
+        processFile(file, results, maxThreads, cache, &cacheMutex)
+    }
+
+    close(results)
+
+    // 将结果保存到 CSV 文件
+    outFile, err := os.Create("output/auth-tld-ns.csv")
+    if err != nil {
+        fmt.Println("Error creating output file:", err)
+        return
+    }
+    defer outFile.Close()
+
+    writer := csv.NewWriter(outFile)
+    defer writer.Flush()
+
+    writer.Write([]string{"domain", "NS", "IP"})
+    writer.WriteAll(finalResults)
+}
