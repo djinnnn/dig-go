@@ -11,6 +11,7 @@ import (
     "github.com/schollz/progressbar/v3"
 	"regexp"
     "path/filepath"
+    "flag"
 )
 
 
@@ -204,8 +205,11 @@ func processFile(filename string, resultsIPv4 chan<- [][]string, resultsIPv6 cha
 
 
 func main() {
-    //files := []string{"/home/lcl/wy/Projects/DoQ/auth/input-rowdata/tls-domain.csv"}
-	files, err := filepath.Glob(filepath.Join("chunk-data", "chunk_*.csv"))
+    chunkDir := flag.String("dir", "chunk-data", "The directory containing chunk files")
+    flag.Parse()  // 解析命令行参数
+
+    // 使用命令行传入的目录路径
+    files, err := filepath.Glob(filepath.Join(*chunkDir, "chunk_*.csv"))
     resultsIPv4 := make(chan [][]string)
     resultsIPv6 := make(chan [][]string)
     finalResultsIPv4 := make([][]string, 0)
@@ -256,7 +260,7 @@ func main() {
 
     // 写入 IPv4 结果
     fmt.Printf("[INFO] Writing %d IPv4 results to file\n", len(finalResultsIPv4))
-    outFileIPv4, err := os.Create("output/auth-tld-ns-ipv4.csv")
+    outFileIPv4, err := os.Create("output/auth-ns-ipv4.csv")
     if err != nil {
         fmt.Println("Error creating IPv4 output file:", err)
         return
@@ -271,7 +275,7 @@ func main() {
 
     // 写入 IPv6 结果
     fmt.Printf("[INFO] Writing %d IPv6 results to file\n", len(finalResultsIPv6))
-    outFileIPv6, err := os.Create("output/auth-tld-ns-ipv6.csv")
+    outFileIPv6, err := os.Create("output/auth-ns-ipv6.csv")
     if err != nil {
         fmt.Println("Error creating IPv6 output file:", err)
         return
