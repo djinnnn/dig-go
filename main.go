@@ -3,7 +3,7 @@ package main
 import (
     "bufio"
     "encoding/csv"
-    "fmt"
+    //"fmt"
     "os"
     "os/exec"
     "strings"
@@ -12,6 +12,7 @@ import (
 	"regexp"
     "path/filepath"
     "flag"
+    "log"
 )
 
 
@@ -22,7 +23,7 @@ func digNS(domain string, mu *sync.Mutex) map[string][]string {
     cmd := exec.Command("dig", domain, "NS", "+additional")
     output, err := cmd.Output()
     if err != nil {
-        fmt.Printf("[Error] Failed to execute dig command for domain %s: %v\n", domain, err)
+        log.Printf("[Error] Failed to execute dig command for domain %s: %v\n", domain, err)
         return nil
     }
 
@@ -51,7 +52,7 @@ func digNS(domain string, mu *sync.Mutex) map[string][]string {
 
         // 解析 ADDITIONAL 部分中的 A 和 AAAA 记录
         if parsingAdditional {
-			fmt.Printf("[DEBUG] Additional.\n")
+			log.Printf("[DEBUG] Additional.\n")
             if strings.Contains(line, " IN A ") || strings.Contains(line, " IN AAAA ") {
                 parts := strings.Fields(line)
                 if len(parts) >= 5 {
@@ -59,7 +60,7 @@ func digNS(domain string, mu *sync.Mutex) map[string][]string {
                     ip := parts[4]
                     if _, exists := nsRecords[ns]; exists {
                         nsRecords[ns] = append(nsRecords[ns], ip)
-                        fmt.Printf("[DEBUG] Found IP %s for NS %s of domain %s\n", ip, ns, domain)
+                        log.Printf("[DEBUG] Found IP %s for NS %s of domain %s\n", ip, ns, domain)
                     }
                 }
             }
@@ -78,7 +79,7 @@ func digIP(ns string, mu *sync.Mutex) ([]string, []string) {
     cmd := exec.Command("dig", ns, "A", "+short")
     output, err := cmd.Output()
     if err != nil {
-        fmt.Printf("[Error] Failed to execute dig command for A record of NS %s: %v\n", ns, err)
+        log.Printf("[Error] Failed to execute dig command for A record of NS %s: %v\n", ns, err)
     } else {
         scanner := bufio.NewScanner(strings.NewReader(string(output)))
         for scanner.Scan() {
@@ -96,7 +97,7 @@ func digIP(ns string, mu *sync.Mutex) ([]string, []string) {
     cmd = exec.Command("dig", ns, "AAAA", "+short")
     output, err = cmd.Output()
     if err != nil {
-        fmt.Printf("[Error] Failed to execute dig command for AAAA record of NS %s: %v\n", ns, err)
+        log.Printf("[Error] Failed to execute dig command for AAAA record of NS %s: %v\n", ns, err)
     } else {
         scanner := bufio.NewScanner(strings.NewReader(string(output)))
         for scanner.Scan() {
@@ -160,7 +161,7 @@ func processFile(filename string, resultsIPv4 chan<- [][]string, resultsIPv6 cha
 
     file, err := os.Open(filename)
     if err != nil {
-        fmt.Println("Error opening file:", err)
+        log.Println("Error opening file:", err)
         return
     }
     defer file.Close()
@@ -168,7 +169,7 @@ func processFile(filename string, resultsIPv4 chan<- [][]string, resultsIPv6 cha
     reader := csv.NewReader(file)
     domains, err := reader.ReadAll()
     if err != nil {
-        fmt.Println("Error reading CSV:", err)
+        log.Println("Error reading CSV:", err)
         return
     }
 
@@ -198,7 +199,7 @@ func processFile(filename string, resultsIPv4 chan<- [][]string, resultsIPv6 cha
     wg.Wait()
     bar.Finish()
 
-    fmt.Printf("[INFO] Sending %d IPv4 records and %d IPv6 records to results channels from file %s\n", len(chunkResultsIPv4), len(chunkResultsIPv6), filename)
+    log.Printf("[INFO] Sending %d IPv4 records and %d IPv6 records to results channels from file %s\n", len(chunkResultsIPv4), len(chunkResultsIPv6), filename)
     resultsIPv4 <- chunkResultsIPv4 // 确保所有 IPv4 结果发送到通道
     resultsIPv6 <- chunkResultsIPv6 // 确保所有 IPv6 结果发送到通道
 }
@@ -213,6 +214,14 @@ func main() {
     // 使用命令行传入的目录路径
     //files, err := filepath.Glob(filepath.Join(*chunkDir, "chunk*.csv"))
     files := []string{*FilePath}
+
+    errorLogFile, err := os.OpenFile("output/error_log.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Failed to open error log file: %v", err)
+	}
+    defer errorLogFile.Close()
+
+	log.SetOutput(errorLogFile)
 
     resultsIPv4 := make(chan [][]string)
     resultsIPv6 := make(chan [][]string)
@@ -230,9 +239,9 @@ func main() {
         defer resultsWaitGroup.Done()
         for res := range resultsIPv4 {
             finalResultsMutex.Lock()
-            fmt.Printf("[INFO] Received %d IPv4 records, processing...\n", len(res))
+            log.Printf("[INFO] Received %d IPv4 records, processing...\n", len(res))
             finalResultsIPv4 = append(finalResultsIPv4, res...)
-            fmt.Printf("[INFO] Total IPv4 records in finalResults: %d\n", len(finalResultsIPv4))
+            log.Printf("[INFO] Total IPv4 records in finalResults: %d\n", len(finalResultsIPv4))
             finalResultsMutex.Unlock()
         }
     }()
@@ -242,9 +251,9 @@ func main() {
         defer resultsWaitGroup.Done()
         for res := range resultsIPv6 {
             finalResultsMutex.Lock()
-            fmt.Printf("[INFO] Received %d IPv6 records, processing...\n", len(res))
+            log.Printf("[INFO] Received %d IPv6 records, processing...\n", len(res))
             finalResultsIPv6 = append(finalResultsIPv6, res...)
-            fmt.Printf("[INFO] Total IPv6 records in finalResults: %d\n", len(finalResultsIPv6))
+            log.Printf("[INFO] Total IPv6 records in finalResults: %d\n", len(finalResultsIPv6))
             finalResultsMutex.Unlock()
         }
     }()
@@ -263,11 +272,11 @@ func main() {
     resultsWaitGroup.Wait()  // 等待所有数据接收完毕
 
     // 写入 IPv4 结果
-    fmt.Printf("[INFO] Writing %d IPv4 results to file\n", len(finalResultsIPv4))
+    log.Printf("[INFO] Writing %d IPv4 results to file\n", len(finalResultsIPv4))
     outFileIPv4Path := "output/" + fileNameWithExt+"_IPv4.csv"
     outFileIPv4, err := os.Create(outFileIPv4Path)
     if err != nil {
-        fmt.Println("Error creating IPv4 output file:", err)
+        log.Println("Error creating IPv4 output file:", err)
         return
     }
     defer outFileIPv4.Close()
@@ -279,11 +288,11 @@ func main() {
     writerIPv4.WriteAll(finalResultsIPv4)
 
     // 写入 IPv6 结果
-    fmt.Printf("[INFO] Writing %d IPv6 results to file\n", len(finalResultsIPv6))
+    log.Printf("[INFO] Writing %d IPv6 results to file\n", len(finalResultsIPv6))
     outFileIPv6Path := "output/" + fileNameWithExt+"_IPv6.csv"
     outFileIPv6, err := os.Create(outFileIPv6Path)
     if err != nil {
-        fmt.Println("Error creating IPv6 output file:", err)
+        log.Println("Error creating IPv6 output file:", err)
         return
     }
     defer outFileIPv6.Close()
@@ -294,5 +303,5 @@ func main() {
     writerIPv6.Write([]string{"domain", "NS", "IP"})
     writerIPv6.WriteAll(finalResultsIPv6)
 
-    fmt.Println("[INFO] Finished writing results to output/auth-ns-ipv4.csv and output/auth-ns-ipv6.csv\n")
+    log.Println("[INFO] Finished writing results to output/auth-ns-ipv4.csv and output/auth-ns-ipv6.csv\n")
 }

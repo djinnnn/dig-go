@@ -1,0 +1,2 @@
+2024/09/11 00:55:49 [Error] Failed to execute dig command for domain reddit.com/user/Marie001: exit status 9
+2024/09/11 00:55:53 [Error] Failed to execute dig command for domain passport.zhulong.com/user/logout: exit status 9
