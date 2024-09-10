@@ -10,12 +10,12 @@ import (
     "sync"
     "github.com/schollz/progressbar/v3"
 	"regexp"
-    "path/filepath"
-    "flag"
+    //"path/filepath"
+    //"flag"
 )
 
 
-func digNS(domain string, mu *sync.Mutex) map[string][]string {
+func digNS(domain string) map[string][]string {
 	nsRegex := regexp.MustCompile(`\S+\s+IN\s+NS\s+(\S+)`)  // 匹配 NS 记录的正则表达式
 
     // 执行 dig 查询 NS 记录，并获取 ADDITIONAL 部分的 A 和 AAAA 记录
@@ -70,7 +70,7 @@ func digNS(domain string, mu *sync.Mutex) map[string][]string {
 }
 
 
-func digIP(ns string, mu *sync.Mutex) ([]string, []string) {
+func digIP(ns string) ([]string, []string) {
     var ipv4Records []string
     var ipv6Records []string
 
@@ -112,17 +112,20 @@ func digIP(ns string, mu *sync.Mutex) ([]string, []string) {
     return ipv4Records, ipv6Records
 }
 
-func processDomain(domain string, mu *sync.Mutex, resultsIPv4 *[][]string, resultsIPv6 *[][]string, bar *progressbar.ProgressBar, sem chan struct{}) {
-    defer func() { <-sem }() // 释放一个占用的通道
+func processDomain(domain string, resultsIPv4 *[][]string, resultsIPv6 *[][]string, bar *progressbar.ProgressBar, sem chan struct{}, wg *sync.WaitGroup) {
+    defer func() {
+        <-sem // 释放信号量位置
+        wg.Done()
+    }()
 
-    nsRecords := digNS(domain, mu)
+	nsRecords := digNS(domain)
     var domainNSIPv4List [][]string
     var domainNSIPv6List [][]string
 
     if len(nsRecords) > 0 {
         for ns := range nsRecords {
 			//println(ns)
-            ipv4Records, ipv6Records := digIP(ns, mu)  // 查询 IPv4 和 IPv6 地址
+            ipv4Records, ipv6Records := digIP(ns)  // 查询 IPv4 和 IPv6 地址
             //println("124: ", ns,": ",ipv4Records)
             if len(ipv4Records) == 0 {
                 domainNSIPv4List = append(domainNSIPv4List, []string{domain, ns, ""})  // 保存空 IP 的记录
@@ -147,15 +150,16 @@ func processDomain(domain string, mu *sync.Mutex, resultsIPv4 *[][]string, resul
         domainNSIPv6List = append(domainNSIPv6List, []string{domain, "", ""})
     }
 
-    mu.Lock()
+	//mu.Lock()
     *resultsIPv4 = append(*resultsIPv4, domainNSIPv4List...)
     *resultsIPv6 = append(*resultsIPv6, domainNSIPv6List...)
-    mu.Unlock()
+    //mu.Unlock()
+
 
     bar.Add(1)
 }
 
-func processFile(filename string, resultsIPv4 chan<- [][]string, resultsIPv6 chan<- [][]string, maxThreads int, cacheMutex *sync.Mutex, wgMain *sync.WaitGroup) {
+func processFile(filename string, resultsIPv4 chan<- [][]string, resultsIPv6 chan<- [][]string, maxThreads int, wgMain *sync.WaitGroup) {
     defer wgMain.Done()
 
     file, err := os.Open(filename)
@@ -172,8 +176,6 @@ func processFile(filename string, resultsIPv4 chan<- [][]string, resultsIPv6 cha
         return
     }
 
-    var wg sync.WaitGroup
-    var mu sync.Mutex
     chunkResultsIPv4 := make([][]string, 0)
     chunkResultsIPv6 := make([][]string, 0)
     bar := progressbar.NewOptions(len(domains)-1,
@@ -184,41 +186,30 @@ func processFile(filename string, resultsIPv4 chan<- [][]string, resultsIPv6 cha
         progressbar.OptionShowIts(),
     )
 
-    sem := make(chan struct{}, maxThreads)
+    sem := make(chan struct{}, maxThreads) // 信号量限制并发数量
+    var wg sync.WaitGroup
+	//var mu sync.Mutex
 
     for _, domain := range domains[1:] { // 跳过标题行
         wg.Add(1)
-        sem <- struct{}{}
-        go func(domain string) {
-            defer wg.Done()
-            processDomain(domain, &mu, &chunkResultsIPv4, &chunkResultsIPv6, bar, sem)
-        }(domain[0])
+        sem <- struct{}{} // 占用一个并发位置
+        go processDomain(domain[0], &chunkResultsIPv4, &chunkResultsIPv6, bar, sem, &wg)
     }
 
     wg.Wait()
     bar.Finish()
 
     fmt.Printf("[INFO] Sending %d IPv4 records and %d IPv6 records to results channels from file %s\n", len(chunkResultsIPv4), len(chunkResultsIPv6), filename)
-    resultsIPv4 <- chunkResultsIPv4 // 确保所有 IPv4 结果发送到通道
-    resultsIPv6 <- chunkResultsIPv6 // 确保所有 IPv6 结果发送到通道
+    resultsIPv4 <- chunkResultsIPv4
+    resultsIPv6 <- chunkResultsIPv6
 }
 
-
 func main() {
-    FilePath := flag.String("dir", "chunk-data", "The directory containing chunk files")
-    flag.Parse()  // 解析命令行参数
-    
-    fileNameWithExt := filepath.Base(*FilePath)
-
-    // 使用命令行传入的目录路径
-    //files, err := filepath.Glob(filepath.Join(*chunkDir, "chunk*.csv"))
-    files := []string{*FilePath}
-
+    files := []string{"/home/lcl/wy/Projects/DoQ/auth/input-rowdata/tls-domain.csv"}
     resultsIPv4 := make(chan [][]string)
     resultsIPv6 := make(chan [][]string)
     finalResultsIPv4 := make([][]string, 0)
     finalResultsIPv6 := make([][]string, 0)
-    var cacheMutex sync.Mutex  // cacheMutex 虽然不再需要 cache，但仍需要锁来处理并发
     var wgMain sync.WaitGroup
     var finalResultsMutex sync.Mutex
     var resultsWaitGroup sync.WaitGroup
@@ -230,9 +221,7 @@ func main() {
         defer resultsWaitGroup.Done()
         for res := range resultsIPv4 {
             finalResultsMutex.Lock()
-            fmt.Printf("[INFO] Received %d IPv4 records, processing...\n", len(res))
             finalResultsIPv4 = append(finalResultsIPv4, res...)
-            fmt.Printf("[INFO] Total IPv4 records in finalResults: %d\n", len(finalResultsIPv4))
             finalResultsMutex.Unlock()
         }
     }()
@@ -242,30 +231,27 @@ func main() {
         defer resultsWaitGroup.Done()
         for res := range resultsIPv6 {
             finalResultsMutex.Lock()
-            fmt.Printf("[INFO] Received %d IPv6 records, processing...\n", len(res))
             finalResultsIPv6 = append(finalResultsIPv6, res...)
-            fmt.Printf("[INFO] Total IPv6 records in finalResults: %d\n", len(finalResultsIPv6))
             finalResultsMutex.Unlock()
         }
     }()
 
-    maxThreads := 10
+    maxThreads := 10 // 每个文件中域名的并发数限制
 
+    // 顺序处理文件，但对每个文件内的域名进行并发查询
     for _, file := range files {
         wgMain.Add(1)
-        go processFile(file, resultsIPv4, resultsIPv6, maxThreads, &cacheMutex, &wgMain)  // 移除 cache 参数
+        go processFile(file, resultsIPv4, resultsIPv6, maxThreads, &wgMain)
     }
 
-    wgMain.Wait()  // 等待所有文件处理完成
-    close(resultsIPv4) // 确保所有 IPv4 数据传输完成后再关闭通道
-    close(resultsIPv6) // 确保所有 IPv6 数据传输完成后再关闭通道
+    wgMain.Wait() // 等待所有文件处理完成
+    close(resultsIPv4)
+    close(resultsIPv6)
 
-    resultsWaitGroup.Wait()  // 等待所有数据接收完毕
+    resultsWaitGroup.Wait() // 等待所有结果处理完毕
 
-    // 写入 IPv4 结果
-    fmt.Printf("[INFO] Writing %d IPv4 results to file\n", len(finalResultsIPv4))
-    outFileIPv4Path := "output/" + fileNameWithExt+"_IPv4.csv"
-    outFileIPv4, err := os.Create(outFileIPv4Path)
+	fmt.Printf("[INFO] Writing %d IPv4 results to file\n", len(finalResultsIPv4))
+    outFileIPv4, err := os.Create("output/auth-tld-ns-ipv4-v3.csv")
     if err != nil {
         fmt.Println("Error creating IPv4 output file:", err)
         return
@@ -280,8 +266,7 @@ func main() {
 
     // 写入 IPv6 结果
     fmt.Printf("[INFO] Writing %d IPv6 results to file\n", len(finalResultsIPv6))
-    outFileIPv6Path := "output/" + fileNameWithExt+"_IPv6.csv"
-    outFileIPv6, err := os.Create(outFileIPv6Path)
+    outFileIPv6, err := os.Create("output/auth-tld-ns-ipv6-v3.csv")
     if err != nil {
         fmt.Println("Error creating IPv6 output file:", err)
         return
@@ -294,5 +279,4 @@ func main() {
     writerIPv6.Write([]string{"domain", "NS", "IP"})
     writerIPv6.WriteAll(finalResultsIPv6)
 
-    fmt.Println("[INFO] Finished writing results to output/auth-ns-ipv4.csv and output/auth-ns-ipv6.csv\n")
-}
+    fmt.Println("[INFO] Finished writing results to output/auth-ns-ipv4.csv and output/auth-ns-ipv6.csv\n")}
